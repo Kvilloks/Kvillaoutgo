@@ -23,16 +23,127 @@ get_all_ips() {
     ip addr show | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1
 }
 
+# ============================================================
+# UNIVERSAL GATEWAY DETECTION
+# ============================================================
+# Priority:
+# 1) If policy routing already exists for this IP (custom netplan/networkd rule) - reuse it
+# 2) Heuristic: gateway = network address + 1 (most common hosting convention)
+# 3) Fallback: shared default gateway from main table (works for flat single-gateway hosts)
+detect_gateway_for_ip() {
+    local ip="$1"
+    local table gw cidr iface
+
+    read -r iface cidr <<< "$(ip -o addr show | awk -v ip="$ip" '$0 ~ ip"/" {print $2, $4}' | head -1)"
+
+    table=$(ip rule list | grep "from $ip " | grep -oP 'lookup \K[0-9]+' | head -1)
+    if [ -n "$table" ]; then
+        gw=$(ip route show table "$table" 2>/dev/null | grep "^default" | awk '{print $3}' | head -1)
+        if [ -n "$gw" ]; then
+            echo "$gw|$iface"
+            return
+        fi
+    fi
+
+    if [ -n "$cidr" ]; then
+        gw=$(python3 -c "
+import ipaddress
+net = ipaddress.ip_interface('$cidr').network
+print(str(net.network_address + 1))
+" 2>/dev/null)
+        if [ -n "$gw" ] && [ "$gw" != "$ip" ]; then
+            echo "$gw|$iface"
+            return
+        fi
+    fi
+
+    gw=$(ip route show | grep "^default" | awk '{print $3}' | head -1)
+    iface=${iface:-$(ip route show | grep "^default" | awk '{print $5}' | head -1)}
+    echo "$gw|$iface"
+}
+
+# ============================================================
+# AUTO-CLEANUP
+# ============================================================
+cleanup_dead_services() {
+    local FOUND_DEAD=0
+    local SERVICE_FILE SERVICE_NAME IP_SAFE SERVICE_IP
+    local SOCKS_SERVICE TABLE_ID MARK_ID
+    local IFACE
+
+    declare -A ACTIVE_IPS_MAP
+    while IFS= read -r ip; do
+        ACTIVE_IPS_MAP["$ip"]=1
+    done < <(get_all_ips)
+
+    IFACE=$(ip route show | grep "^default" | awk '{print $5}' | head -1)
+
+    for SERVICE_FILE in /etc/systemd/system/hysteria-server-*.service; do
+        [ -f "$SERVICE_FILE" ] || continue
+
+        SERVICE_NAME=$(basename "$SERVICE_FILE" .service)
+        IP_SAFE=$(echo "$SERVICE_NAME" | sed 's/hysteria-server-//')
+        SERVICE_IP=$(echo "$IP_SAFE" | tr '_' '.')
+
+        [[ "${ACTIVE_IPS_MAP[$SERVICE_IP]+_}" ]] && continue
+
+        if [ "$FOUND_DEAD" -eq 0 ]; then
+            echo ""
+            echo "🧹 ============================================"
+            echo "🧹  CLEANUP: Found services for removed IPs"
+            echo "🧹 ============================================"
+            FOUND_DEAD=1
+        fi
+
+        echo "🗑️  Removing dead service for IP: $SERVICE_IP"
+        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+        rm -f "$SERVICE_FILE"
+
+        SOCKS_SERVICE="microsocks-${IP_SAFE}"
+        if [ -f "/etc/systemd/system/${SOCKS_SERVICE}.service" ]; then
+            systemctl stop "$SOCKS_SERVICE" 2>/dev/null || true
+            systemctl disable "$SOCKS_SERVICE" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${SOCKS_SERVICE}.service"
+        fi
+
+        rm -f "/etc/hysteria/config_${IP_SAFE}.yaml" \
+              "/etc/hysteria/cert_${IP_SAFE}.pem" \
+              "/etc/hysteria/key_${IP_SAFE}.pem"
+
+        TABLE_ID=$(echo "$SERVICE_IP" | cksum | awk '{print ($1 % 8000) + 1000}')
+        MARK_ID=$TABLE_ID
+
+        if [ -n "$IFACE" ]; then
+            ip rule del from "$SERVICE_IP" table "$TABLE_ID" 2>/dev/null || true
+            while iptables -t mangle -D POSTROUTING -s "$SERVICE_IP" -j TTL --ttl-set 128 2>/dev/null; do :; done
+            tc filter del dev "$IFACE" protocol ip parent 1:0 prio "$MARK_ID" 2>/dev/null || true
+            tc class del dev "$IFACE" classid "1:${MARK_ID}" 2>/dev/null || true
+        fi
+        echo "   ✅ Fully cleaned: $SERVICE_IP"
+    done
+
+    if [ "$FOUND_DEAD" -eq 1 ]; then
+        systemctl daemon-reload
+        echo "🧹 Cleanup complete"
+    else
+        echo "✅ No dead services found."
+    fi
+}
+
+cleanup_dead_services
+
+
 select_ip() {
     IPS=($(get_all_ips))
-    
+
     if [ ${#IPS[@]} -eq 0 ]; then
         echo "❌ No public IP addresses found."
         read -p "Enter IP address manually: " MANUAL_IP
         echo "$MANUAL_IP"
         return
     fi
-    
+
     echo ""
     echo "=============================="
     echo "Available IP addresses on the server:"
@@ -52,7 +163,7 @@ select_ip
 
 while true; do
     read -p "Select IP number (1-${#IPS[@]}): " IP_CHOICE
-    
+
     if [[ "$IP_CHOICE" =~ ^[0-9]+$ ]] && [ "$IP_CHOICE" -ge 1 ] && [ "$IP_CHOICE" -le ${#IPS[@]} ]; then
         SELECTED_IP="${IPS[$((IP_CHOICE-1))]}"
         break
@@ -88,26 +199,25 @@ SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SOCKS_SERVICE_NAME="microsocks-${IP_SAFE}"
 SOCKS_SERVICE_PATH="/etc/systemd/system/${SOCKS_SERVICE_NAME}.service"
 
-# Unique routing table and marker based on the last IP octet (Collision protection)
-# Уникальная таблица и маркер на основе хэша от полного IP-адреса (100% защита от коллизий)
-# Уникальный ID от 1000 до 8999 (безопасно и для iproute2, и для HEX-парсера tc)
 TABLE_ID=$(echo "$SELECTED_IP" | cksum | awk '{print ($1 % 8000) + 1000}')
 MARK_ID=$TABLE_ID
 
-# Get gateway and interface for routing
-GATEWAY=$(ip route show | grep "^default" | awk '{print $3}' | head -1)
-INTERFACE=$(ip route show | grep "^default" | awk '{print $5}' | head -1)
+# --- UNIVERSAL GATEWAY/INTERFACE DETECTION ---
+GW_IFACE=$(detect_gateway_for_ip "$SELECTED_IP")
+GATEWAY="${GW_IFACE%%|*}"
+INTERFACE="${GW_IFACE##*|}"
 
 if [ -z "$GATEWAY" ] || [ -z "$INTERFACE" ]; then
     echo "⚠️ Warning: Failed to determine gateway. Routing may not work correctly."
-    GATEWAY="127.0.0.1" 
+    GATEWAY="127.0.0.1"
     INTERFACE="eth0"
 fi
+
+echo "🌐 Detected gateway for $SELECTED_IP: $GATEWAY (via $INTERFACE)"
 
 # --- GLOBAL ANTI-DETECT OS & NETWORK OPTIMIZATIONS ---
 echo "🥷 Applying global kernel network settings and DNS protection..."
 
-# Strict DNS protection
 if ! grep -q "nameserver 8.8.8.8" /etc/resolv.conf 2>/dev/null; then
     systemctl stop systemd-resolved 2>/dev/null || true
     systemctl disable systemd-resolved 2>/dev/null || true
@@ -118,7 +228,6 @@ if ! grep -q "nameserver 8.8.8.8" /etc/resolv.conf 2>/dev/null; then
     chattr +i /etc/resolv.conf
 fi
 
-# Advanced network settings (BBR, Forwarding, TCP Timestamps, Nonlocal Bind)
 cat > /etc/sysctl.d/99-proxy-tuning.conf <<EOF
 net.ipv4.tcp_timestamps=0
 net.core.default_qdisc=fq
@@ -128,7 +237,6 @@ net.ipv4.ip_nonlocal_bind=1
 EOF
 sysctl --system > /dev/null 2>&1 || true
 
-# Base packages
 PACKAGES="wget curl tar openssl qrencode python3 iptables iproute2 e2fsprogs"
 if [ "$SOCKS_CHOICE" == "1" ]; then
     PACKAGES="$PACKAGES build-essential git"
@@ -140,14 +248,12 @@ if [ ! -f "/usr/local/bin/hysteria" ] || { [ "$SOCKS_CHOICE" == "1" ] && [ ! -f 
   apt install -y $PACKAGES
 fi
 
-# Check and install yq utility
 if ! command -v yq &> /dev/null; then
   echo "📥 Installing yq ($YQ_ARCH architecture)..."
   wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${YQ_ARCH}"
   chmod +x /usr/local/bin/yq
 fi
 
-# --- Hysteria2 Installation ---
 if [ ! -f "/usr/local/bin/hysteria" ]; then
   echo "⬇️  Fetching the latest Hysteria2 version..."
   VERSION=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
@@ -159,7 +265,6 @@ else
   echo "✅ Hysteria2 is already installed."
 fi
 
-# --- SOCKS5 (microsocks) Installation ---
 if [ "$SOCKS_CHOICE" == "1" ] && [ ! -f "/usr/local/bin/microsocks" ]; then
   echo "📦 Compiling MicroSocks..."
   cd /tmp
@@ -171,7 +276,6 @@ if [ "$SOCKS_CHOICE" == "1" ] && [ ! -f "/usr/local/bin/microsocks" ]; then
   cd ~
 fi
 
-# --- Configuration Logic ---
 if [ ! -f "$CONFIG_PATH" ]; then
   echo "🔐 Generating certificate for IP $SELECTED_IP..."
   mkdir -p /etc/hysteria
@@ -210,8 +314,7 @@ acl:
 EOF
   chmod 600 "$CONFIG_PATH"
 
-  DELAY=$(shuf -i 4-15 -n 1)           
-             
+  DELAY=$(shuf -i 4-15 -n 1)
 
   echo "🔧 Creating Hysteria2 systemd service (Anti-Detect) for IP $SELECTED_IP..."
   cat > "$SERVICE_PATH" <<EOF
@@ -297,7 +400,7 @@ else
     yq -i '.outbounds = [{"name": "ip_outbound", "type": "direct", "direct": {"bindIPv4": "'$SELECTED_IP'"}}]' "$CONFIG_PATH"
     yq -i '.acl.inline = ["ip_outbound(all)"]' "$CONFIG_PATH"
   fi
-  
+
   if [ "$(yq eval '.resolver' "$CONFIG_PATH")" = "null" ]; then
     echo "🔧 Adding secure DNS (Google DoH) to the existing config..."
     yq -i '.resolver.type = "https"' "$CONFIG_PATH"
@@ -309,7 +412,7 @@ else
 
   echo "🔄 Restarting Hysteria2 for IP $SELECTED_IP..."
   systemctl restart $SERVICE_NAME
-  
+
   if [ "$SOCKS_CHOICE" == "1" ]; then
     echo "⚠️ WARNING: SOCKS5 will be overwritten for this IP!"
     cat > "$SOCKS_SERVICE_PATH" <<EOF
@@ -334,7 +437,6 @@ EOF
   fi
 fi
 
-# URL-encode password
 ENCODED_PASS=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$NEW_PASS', safe=''))")
 HYST_LINK="hysteria2://$NEW_USER:$ENCODED_PASS@$SELECTED_IP:443/?insecure=1"
 
@@ -344,29 +446,26 @@ else
     SOCKS_LINK="-"
 fi
 
-# --- SEND TO GOOGLE SHEETS ---
 if [ -n "$WEBHOOK_URL" ]; then
     echo "📊 Sending data to Google Sheets..."
     SHEET_IP="${SELECTED_IP}:1080"
-    
-    # Base curl command
+
     CURL_CMD=(curl -s -L -X POST "$WEBHOOK_URL"
         --data-urlencode "ip=$SHEET_IP"
         --data-urlencode "user=$NEW_USER"
         --data-urlencode "pass=$NEW_PASS"
         --data-urlencode "hyst=$HYST_LINK"
         --data-urlencode "socks=$SOCKS_LINK")
-    
-    # Append sheetName only if SHEET_NAME variable is provided
+
     if [ -n "$SHEET_NAME" ]; then
         CURL_CMD+=(--data-urlencode "sheetName=$SHEET_NAME")
         TARGET_SHEET="$SHEET_NAME"
     else
         TARGET_SHEET="Default Sheet"
     fi
-        
+
     HTTP_RESPONSE=$("${CURL_CMD[@]}")
-        
+
     if [[ "$HTTP_RESPONSE" == *"Success"* ]]; then
         echo "✅ Data successfully added to the sheet ($TARGET_SHEET)!"
     else
