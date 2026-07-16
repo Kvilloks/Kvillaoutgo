@@ -250,7 +250,7 @@ fi
 
 if ! command -v yq &> /dev/null; then
   echo "📥 Installing yq ($YQ_ARCH architecture)..."
-  wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${YQ_ARCH}"
+  wget -4 --timeout=30 --tries=3 -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${YQ_ARCH}"
   chmod +x /usr/local/bin/yq
 fi
 
@@ -259,7 +259,7 @@ if [ ! -f "/usr/local/bin/hysteria" ]; then
   VERSION=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
 
   echo "📥 Downloading Hysteria2 version $VERSION ($HYS_ARCH architecture)..."
-  wget -qO /usr/local/bin/hysteria "https://github.com/apernet/hysteria/releases/download/${VERSION}/hysteria-linux-${HYS_ARCH}"
+  wget -4 --timeout=30 --tries=3 -qO /usr/local/bin/hysteria "https://github.com/apernet/hysteria/releases/download/${VERSION}/hysteria-linux-${HYS_ARCH}"
   chmod +x /usr/local/bin/hysteria
 else
   echo "✅ Hysteria2 is already installed."
