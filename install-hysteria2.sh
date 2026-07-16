@@ -264,7 +264,7 @@ if [ ! -f "/usr/local/bin/hysteria" ]; then
 else
   echo "✅ Hysteria2 is already installed."
 fi
-
+chmod +x /usr/local/bin/hysteria 
 if [ "$SOCKS_CHOICE" == "1" ] && [ ! -f "/usr/local/bin/microsocks" ]; then
   echo "📦 Compiling MicroSocks..."
   cd /tmp
