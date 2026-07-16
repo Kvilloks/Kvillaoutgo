@@ -20,46 +20,79 @@ case "$ARCH" in
 esac
 
 get_all_ips() {
-    ip addr show | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1
+    ip addr show | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 | \
+    grep -Ev '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)'
 }
 
 # ============================================================
-# UNIVERSAL GATEWAY DETECTION
+# UNIVERSAL GATEWAY DETECTION (with real connectivity test)
 # ============================================================
-# Priority:
-# 1) If policy routing already exists for this IP (custom netplan/networkd rule) - reuse it
-# 2) Heuristic: gateway = network address + 1 (most common hosting convention)
-# 3) Fallback: shared default gateway from main table (works for flat single-gateway hosts)
+# Логика:
+# 1) Если задана переменная MANUAL_GATEWAY - используем её без тестов (аварийный ручной режим)
+# 2) Если уже есть policy routing для этого IP - берём шлюз оттуда (без теста, он уже проверен ранее)
+# 3) Тестируем кандидата "общий (shared) default gateway из main таблицы" - реальным пингом
+# 4) Тестируем кандидата "эвристика: сеть+1" - реальным пингом
+# 5) Если оба теста не прошли - берём shared gateway как best-effort (лучше, чем ничего)
+
+test_gateway_works() {
+    local ip="$1" gw="$2" iface="$3"
+    [ -z "$gw" ] || [ -z "$iface" ] && return 1
+    ip route add 1.1.1.1/32 via "$gw" dev "$iface" onlink 2>/dev/null
+    local result=1
+    if timeout 4 ping -c 2 -W 2 -I "$ip" 1.1.1.1 &>/dev/null; then
+        result=0
+    fi
+    ip route del 1.1.1.1/32 via "$gw" dev "$iface" onlink 2>/dev/null || true
+    return $result
+}
+
 detect_gateway_for_ip() {
     local ip="$1"
-    local table gw cidr iface
+    local table gw cidr iface shared_gw heuristic_gw
 
     read -r iface cidr <<< "$(ip -o addr show | awk -v ip="$ip" '$0 ~ ip"/" {print $2, $4}' | head -1)"
+    [ -z "$iface" ] && iface=$(ip route show | awk '/^default/{print $5; exit}')
 
+    # 1) Ручное переопределение (без тестов)
+    if [ -n "$MANUAL_GATEWAY" ]; then
+        echo "$MANUAL_GATEWAY|$iface"
+        return
+    fi
+
+    # 2) Уже существующий policy routing (доверяем без повторного теста)
     table=$(ip rule list | grep "from $ip " | grep -oP 'lookup \K[0-9]+' | head -1)
     if [ -n "$table" ]; then
-        gw=$(ip route show table "$table" 2>/dev/null | grep "^default" | awk '{print $3}' | head -1)
+        gw=$(ip route show table "$table" 2>/dev/null | awk '/^default/{print $3; exit}')
         if [ -n "$gw" ]; then
             echo "$gw|$iface"
             return
         fi
     fi
 
+    # 3) Кандидат: общий (shared) шлюз из main-таблицы
+    shared_gw=$(ip route show | awk '/^default/{print $3; exit}')
+
+    # 4) Кандидат: эвристика "сеть+1"
     if [ -n "$cidr" ]; then
-        gw=$(python3 -c "
+        heuristic_gw=$(python3 -c "
 import ipaddress
-net = ipaddress.ip_interface('$cidr').network
-print(str(net.network_address + 1))
+print(str(ipaddress.ip_interface('$cidr').network.network_address + 1))
 " 2>/dev/null)
-        if [ -n "$gw" ] && [ "$gw" != "$ip" ]; then
-            echo "$gw|$iface"
-            return
-        fi
     fi
 
-    gw=$(ip route show | grep "^default" | awk '{print $3}' | head -1)
-    iface=${iface:-$(ip route show | grep "^default" | awk '{print $5}' | head -1)}
-    echo "$gw|$iface"
+    # Реальный тест связи - сначала shared, потом heuristic
+    if [ -n "$shared_gw" ] && test_gateway_works "$ip" "$shared_gw" "$iface"; then
+        echo "$shared_gw|$iface"
+        return
+    fi
+
+    if [ -n "$heuristic_gw" ] && [ "$heuristic_gw" != "$ip" ] && test_gateway_works "$ip" "$heuristic_gw" "$iface"; then
+        echo "$heuristic_gw|$iface"
+        return
+    fi
+
+    # 5) Best-effort fallback
+    echo "${shared_gw:-$heuristic_gw}|$iface"
 }
 
 # ============================================================
@@ -202,7 +235,8 @@ SOCKS_SERVICE_PATH="/etc/systemd/system/${SOCKS_SERVICE_NAME}.service"
 TABLE_ID=$(echo "$SELECTED_IP" | cksum | awk '{print ($1 % 8000) + 1000}')
 MARK_ID=$TABLE_ID
 
-# --- UNIVERSAL GATEWAY/INTERFACE DETECTION ---
+# --- UNIVERSAL GATEWAY/INTERFACE DETECTION (с реальным тестом связности) ---
+echo "🔎 Detecting working gateway for $SELECTED_IP (testing connectivity)..."
 GW_IFACE=$(detect_gateway_for_ip "$SELECTED_IP")
 GATEWAY="${GW_IFACE%%|*}"
 INTERFACE="${GW_IFACE##*|}"
@@ -218,13 +252,13 @@ echo "🌐 Detected gateway for $SELECTED_IP: $GATEWAY (via $INTERFACE)"
 # --- GLOBAL ANTI-DETECT OS & NETWORK OPTIMIZATIONS ---
 echo "🥷 Applying global kernel network settings and DNS protection..."
 
-if ! grep -q "nameserver 8.8.8.8" /etc/resolv.conf 2>/dev/null; then
+if ! grep -q "nameserver 1.1.1.1" /etc/resolv.conf 2>/dev/null; then
     systemctl stop systemd-resolved 2>/dev/null || true
     systemctl disable systemd-resolved 2>/dev/null || true
     chattr -i /etc/resolv.conf 2>/dev/null || true
     rm -f /etc/resolv.conf
-    echo "nameserver 8.8.8.8" > /etc/resolv.conf
-    echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+    echo "nameserver 1.1.1.1" > /etc/resolv.conf
+    echo "nameserver 1.0.0.1" >> /etc/resolv.conf
     chattr +i /etc/resolv.conf
 fi
 
@@ -256,15 +290,15 @@ fi
 
 if [ ! -f "/usr/local/bin/hysteria" ]; then
   echo "⬇️  Fetching the latest Hysteria2 version..."
-  VERSION=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
+  VERSION=$(curl -4 -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
 
   echo "📥 Downloading Hysteria2 version $VERSION ($HYS_ARCH architecture)..."
   wget -4 --timeout=30 --tries=3 -qO /usr/local/bin/hysteria "https://github.com/apernet/hysteria/releases/download/${VERSION}/hysteria-linux-${HYS_ARCH}"
-  chmod +x /usr/local/bin/hysteria
 else
   echo "✅ Hysteria2 is already installed."
 fi
-chmod +x /usr/local/bin/hysteria 
+chmod +x /usr/local/bin/hysteria
+
 if [ "$SOCKS_CHOICE" == "1" ] && [ ! -f "/usr/local/bin/microsocks" ]; then
   echo "📦 Compiling MicroSocks..."
   cd /tmp
@@ -274,6 +308,9 @@ if [ "$SOCKS_CHOICE" == "1" ] && [ ! -f "/usr/local/bin/microsocks" ]; then
   make > /dev/null
   cp microsocks /usr/local/bin/
   cd ~
+fi
+if [ "$SOCKS_CHOICE" == "1" ]; then
+    chmod +x /usr/local/bin/microsocks
 fi
 
 if [ ! -f "$CONFIG_PATH" ]; then
@@ -295,9 +332,9 @@ auth:
 resolver:
   type: https
   https:
-    addr: 8.8.8.8:443
+    addr: 1.1.1.1:443
     timeout: 10s
-    sni: dns.google
+    sni: cloudflare-dns.com
     insecure: false
 masquerade:
   type: proxy
@@ -330,14 +367,14 @@ ExecStartPre=/bin/bash -c "ip rule add from $SELECTED_IP table $TABLE_ID"
 ExecStartPre=/bin/bash -c "ip route replace default via $GATEWAY dev $INTERFACE table $TABLE_ID onlink"
 
 ExecStartPre=-/bin/bash -c "iptables -t mangle -D POSTROUTING -s $SELECTED_IP -j TTL --ttl-set 128 2>/dev/null"
-ExecStartPre=/bin/bash -c "iptables -t mangle -A POSTROUTING -s $SELECTED_IP -j TTL --ttl-set 128"
+ExecStartPre=-/bin/bash -c "iptables -t mangle -A POSTROUTING -s $SELECTED_IP -j TTL --ttl-set 128"
 
 ExecStartPre=-/bin/bash -c "tc qdisc show dev $INTERFACE | grep -q 'htb' || tc qdisc add dev $INTERFACE root handle 1: htb default 10"
 ExecStartPre=-/bin/bash -c "tc class show dev $INTERFACE | grep -q 'classid 1:10' || tc class add dev $INTERFACE parent 1: classid 1:10 htb rate 1000mbit"
 ExecStartPre=-/bin/bash -c "tc class del dev $INTERFACE classid 1:$MARK_ID 2>/dev/null"
-ExecStartPre=/bin/bash -c "tc class add dev $INTERFACE parent 1: classid 1:$MARK_ID htb rate 1000mbit"
-ExecStartPre=/bin/bash -c "tc qdisc add dev $INTERFACE parent 1:$MARK_ID handle $MARK_ID: netem delay ${DELAY}ms"
-ExecStartPre=/bin/bash -c "tc filter add dev $INTERFACE protocol ip parent 1:0 prio $MARK_ID u32 match ip src $SELECTED_IP flowid 1:$MARK_ID"
+ExecStartPre=-/bin/bash -c "tc class add dev $INTERFACE parent 1: classid 1:$MARK_ID htb rate 1000mbit"
+ExecStartPre=-/bin/bash -c "tc qdisc add dev $INTERFACE parent 1:$MARK_ID handle $MARK_ID: netem delay ${DELAY}ms"
+ExecStartPre=-/bin/bash -c "tc filter add dev $INTERFACE protocol ip parent 1:0 prio $MARK_ID u32 match ip src $SELECTED_IP flowid 1:$MARK_ID"
 
 ExecStart=/usr/local/bin/hysteria server -c $CONFIG_PATH
 Restart=always
@@ -402,11 +439,11 @@ else
   fi
 
   if [ "$(yq eval '.resolver' "$CONFIG_PATH")" = "null" ]; then
-    echo "🔧 Adding secure DNS (Google DoH) to the existing config..."
+    echo "🔧 Adding secure DNS (Cloudflare DoH) to the existing config..."
     yq -i '.resolver.type = "https"' "$CONFIG_PATH"
-    yq -i '.resolver.https.addr = "8.8.8.8:443"' "$CONFIG_PATH"
+    yq -i '.resolver.https.addr = "1.1.1.1:443"' "$CONFIG_PATH"
     yq -i '.resolver.https.timeout = "10s"' "$CONFIG_PATH"
-    yq -i '.resolver.https.sni = "dns.google"' "$CONFIG_PATH"
+    yq -i '.resolver.https.sni = "cloudflare-dns.com"' "$CONFIG_PATH"
     yq -i '.resolver.https.insecure = false' "$CONFIG_PATH"
   fi
 
@@ -450,7 +487,7 @@ if [ -n "$WEBHOOK_URL" ]; then
     echo "📊 Sending data to Google Sheets..."
     SHEET_IP="${SELECTED_IP}:1080"
 
-    CURL_CMD=(curl -s -L -X POST "$WEBHOOK_URL"
+    CURL_CMD=(curl -4 -s -L -X POST "$WEBHOOK_URL"
         --data-urlencode "ip=$SHEET_IP"
         --data-urlencode "user=$NEW_USER"
         --data-urlencode "pass=$NEW_PASS"
