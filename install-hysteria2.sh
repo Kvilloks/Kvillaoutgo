@@ -19,6 +19,16 @@ case "$ARCH" in
         ;;
 esac
 
+# ============================================================
+# BASE DEPENDENCIES — устанавливаются в самом начале,
+# ДО того как cleanup_dead_services/detect_gateway_for_ip
+# попытаются использовать ip, iptables, tc, python3, ping и т.д.
+# ============================================================
+echo "📦 Checking base dependencies..."
+BASE_PACKAGES="wget curl tar openssl qrencode python3 iptables iproute2 e2fsprogs iputils-ping"
+apt update -qq
+apt install -y $BASE_PACKAGES
+
 get_all_ips() {
     ip addr show | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 | \
     grep -Ev '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)'
@@ -271,14 +281,14 @@ net.ipv4.ip_nonlocal_bind=1
 EOF
 sysctl --system > /dev/null 2>&1 || true
 
-PACKAGES="wget curl tar openssl qrencode python3 iptables iproute2 e2fsprogs"
+# Доп. пакеты нужны ТОЛЬКО если выбран SOCKS5 (компиляция microsocks)
+PACKAGES=""
 if [ "$SOCKS_CHOICE" == "1" ]; then
-    PACKAGES="$PACKAGES build-essential git"
+    PACKAGES="build-essential git"
 fi
 
-if [ ! -f "/usr/local/bin/hysteria" ] || { [ "$SOCKS_CHOICE" == "1" ] && [ ! -f "/usr/local/bin/microsocks" ]; }; then
-  echo "📦 Installing base dependencies..."
-  apt update
+if [ -n "$PACKAGES" ] && [ ! -f "/usr/local/bin/microsocks" ]; then
+  echo "📦 Installing extra dependencies for SOCKS5..."
   apt install -y $PACKAGES
 fi
 
@@ -518,7 +528,7 @@ if [ -n "$WEBHOOK_URL" ]; then
     echo "📊 Sending data to Google Sheets..."
     SHEET_IP="${SELECTED_IP}:1080"
 
-    CURL_CMD=(curl -4 -s -L -X POST "$WEBHOOK_URL"
+    CURL_CMD=(curl -4 -s -L --max-time 15 --connect-timeout 10 -X POST "$WEBHOOK_URL"
         --data-urlencode "ip=$SHEET_IP"
         --data-urlencode "user=$NEW_USER"
         --data-urlencode "pass=$NEW_PASS"
