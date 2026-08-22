@@ -532,7 +532,7 @@ if [ -n "$WEBHOOK_URL" ]; then
         TARGET_SHEET="Default Sheet"
     fi
 
-    HTTP_RESPONSE=$("${CURL_CMD[@]}")
+    HTTP_RESPONSE=$("${CURL_CMD[@]}") || HTTP_RESPONSE="curl_failed"
 
     if [[ "$HTTP_RESPONSE" == *"Success"* ]]; then
         echo "✅ Data successfully added to the sheet ($TARGET_SHEET)!"
