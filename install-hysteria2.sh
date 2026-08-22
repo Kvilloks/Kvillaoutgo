@@ -26,8 +26,17 @@ esac
 # ============================================================
 echo "📦 Checking base dependencies..."
 BASE_PACKAGES="wget curl tar openssl qrencode python3 iptables iproute2 e2fsprogs iputils-ping"
-apt update -qq
-apt install -y $BASE_PACKAGES
+MISSING_PKGS=""
+for pkg in $BASE_PACKAGES; do
+    dpkg -s "$pkg" &>/dev/null || MISSING_PKGS="$MISSING_PKGS $pkg"
+done
+if [ -n "$MISSING_PKGS" ]; then
+    echo "📦 Installing missing base dependencies:$MISSING_PKGS"
+    apt update -qq
+    apt install -y $MISSING_PKGS
+else
+    echo "✅ All base dependencies already installed."
+fi
 
 get_all_ips() {
     ip addr show | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 | \
