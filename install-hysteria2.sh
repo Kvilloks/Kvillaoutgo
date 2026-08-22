@@ -290,10 +290,33 @@ fi
 
 if [ ! -f "/usr/local/bin/hysteria" ]; then
   echo "⬇️  Fetching the latest Hysteria2 version..."
-  VERSION=$(curl -4 -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep '"tag_name":' | cut -d'"' -f4)
+
+  # Метод 1: GitHub API
+  VERSION=$(curl -4 -s --max-time 10 https://api.github.com/repos/apernet/hysteria/releases/latest \
+             | grep '"tag_name":' | cut -d'"' -f4)
+
+  # Метод 2 (fallback): редирект со страницы /releases/latest — не подпадает под лимит API
+  if [ -z "$VERSION" ]; then
+    echo "⚠️  GitHub API недоступен/лимит исчерпан, пробуем через редирект..."
+    VERSION=$(curl -4 -s --max-time 10 -o /dev/null -w '%{redirect_url}' \
+               https://github.com/apernet/hysteria/releases/latest \
+               | sed -n 's#.*/tag/##p')
+    # decode %2F -> /
+    VERSION=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$VERSION")
+  fi
+
+  if [ -z "$VERSION" ]; then
+    echo "❌ Не удалось определить версию Hysteria2 (GitHub API/редирект не отдали тег)."
+    echo "   Укажите версию вручную, например: VERSION=app/v2.12.1 $0"
+    exit 1
+  fi
 
   echo "📥 Downloading Hysteria2 version $VERSION ($HYS_ARCH architecture)..."
-  wget -4 --timeout=30 --tries=3 -qO /usr/local/bin/hysteria "https://github.com/apernet/hysteria/releases/download/${VERSION}/hysteria-linux-${HYS_ARCH}"
+  if ! wget -4 --timeout=30 --tries=3 -qO /usr/local/bin/hysteria \
+       "https://github.com/apernet/hysteria/releases/download/${VERSION}/hysteria-linux-${HYS_ARCH}"; then
+    echo "❌ Ошибка загрузки бинарника Hysteria2. Проверьте сеть/версию."
+    exit 1
+  fi
 else
   echo "✅ Hysteria2 is already installed."
 fi
