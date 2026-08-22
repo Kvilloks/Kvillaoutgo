@@ -77,7 +77,7 @@ detect_gateway_for_ip() {
         heuristic_gw=$(python3 -c "
 import ipaddress
 print(str(ipaddress.ip_interface('$cidr').network.network_address + 1))
-" 2>/dev/null)
+" 2>/dev/null) || true
     fi
 
     # Реальный тест связи - сначала shared, потом heuristic
