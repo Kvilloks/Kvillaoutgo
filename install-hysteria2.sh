@@ -291,22 +291,30 @@ fi
 if [ ! -f "/usr/local/bin/hysteria" ]; then
   echo "⬇️  Fetching the latest Hysteria2 version..."
 
-  # Метод 1: GitHub API
-  VERSION=$(curl -4 -s --max-time 10 https://api.github.com/repos/apernet/hysteria/releases/latest \
-             | grep '"tag_name":' | cut -d'"' -f4)
+  # Метод 1 (основной, официальный): собственный API Hysteria2, без лимитов GitHub
+  VERSION=$(curl -4 -s --max-time 10 \
+    "https://api.hy2.io/v1/update?cver=installscript&plat=linux&arch=${HYS_ARCH}&chan=release&side=server" \
+    | grep -oP '"lver":\s*"v[0-9.]+"' | cut -d'"' -f4)
+  [ -n "$VERSION" ] && VERSION="app/$VERSION"
 
-  # Метод 2 (fallback): редирект со страницы /releases/latest — не подпадает под лимит API
+  # Метод 2 (fallback): GitHub API
+  if [ -z "$VERSION" ]; then
+    echo "⚠️  api.hy2.io недоступен, пробуем через GitHub API..."
+    VERSION=$(curl -4 -s --max-time 10 https://api.github.com/repos/apernet/hysteria/releases/latest \
+               | grep '"tag_name":' | cut -d'"' -f4)
+  fi
+
+  # Метод 3 (fallback): редирект со страницы /releases/latest — не подпадает под лимит API
   if [ -z "$VERSION" ]; then
     echo "⚠️  GitHub API недоступен/лимит исчерпан, пробуем через редирект..."
     VERSION=$(curl -4 -s --max-time 10 -o /dev/null -w '%{redirect_url}' \
                https://github.com/apernet/hysteria/releases/latest \
                | sed -n 's#.*/tag/##p')
-    # decode %2F -> /
     VERSION=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$VERSION")
   fi
 
   if [ -z "$VERSION" ]; then
-    echo "❌ Не удалось определить версию Hysteria2 (GitHub API/редирект не отдали тег)."
+    echo "❌ Не удалось определить версию Hysteria2 (все 3 метода не сработали)."
     echo "   Укажите версию вручную, например: VERSION=app/v2.12.1 $0"
     exit 1
   fi
